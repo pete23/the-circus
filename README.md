@@ -13,3 +13,4 @@ Specifically, by co-opting an append-only bitemporal database, then layering a d
 - [Business spec](docs/business-spec.md): what the-circus is, who it's for, and the demo.
 - [Tech spec](docs/tech-spec.md): architecture, metamodel, APIs and open questions.
 - [Decision records](docs/adr/): one file per decision.
+- [Coding standards](docs/coding-standards.md): how code is written here.
