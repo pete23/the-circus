@@ -10,5 +10,5 @@ Transition names are unique across all lifecycles of a type, enforced at definit
 
 ## Consequences
 - The URL is a verb on the entity; callers need not know which field it moves.
-- Generated operationIds and event names stay flat.
+- Generated operationIds and transition names in the history feed stay flat.
 - An agent wanting the same verb in two machines renames one, or more likely splits the entity. Two lifecycles that must move together are a batch, or a sign they are one machine.

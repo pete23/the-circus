@@ -21,10 +21,47 @@ A single Clojure service in front of an XTDB2 node. Agents and apps talk to the 
                            ▼
                         XTDB2
           (private network; operators only)
-                           │
-                           ▼
-              events: SSE stream, webhooks
 ```
+
+The XTDB transaction history is the only record of what happened. Nothing is written twice (ADR 0015, 0024).
+
+## Namespaces
+
+A pure core, one stateful layer, and the edges. Integrant components are marked ●. Pure-core namespaces never require state or edge namespaces; clj-kondo enforces this.
+
+```
+the-circus                 -main: load config, start the system. Nothing else.
+the-circus.system          read system.edn, init/halt; integrant.repl hooks
+
+── pure core (no IO) ───────────────────────────────────────────
+the-circus.metamodel       bootstrap `entity` definition; Malli schema of a definition;
+                           integrity rules
+the-circus.compile         definition → validators, defaults, transition table
+the-circus.lifecycle       is this transition legal, what does it set
+the-circus.ops             create/update/transition/repair/erase/batch as data;
+                           op + definition → tx ops or failures
+the-circus.classify        old definition × new definition → additive | breaking, and why
+the-circus.transform       JSONata wrapper, time and memory limits
+the-circus.query           JSON query → XTDB query
+the-circus.openapi         definitions → OpenAPI
+
+── state ───────────────────────────────────────────────────────
+the-circus.xtdb        ●   the node; thin read and submit functions
+the-circus.registry    ●   compiled definitions, as-of lookup; a projection of the
+                           `entity` table, refreshed synchronously by the writer
+the-circus.resolve         path segment → id: UUID, path key, alias → 308
+the-circus.writer      ●   the single writer: serialise, validate, uniqueness and
+                           references, provenance, submit, signal readers
+the-circus.migrate         dry run and apply for breaking changes; worklist
+the-circus.feed            history at three scopes, rendered from the transaction history
+
+── edges ───────────────────────────────────────────────────────
+the-circus.http        ●   reitit on http-kit; routes, JSON ⇄ namespaced keywords,
+                           problem+json, SSE and long-poll, MCP routes
+the-circus.mcp             generic tools, per-type schemas and skills, as routes
+```
+
+A write: `http` → `resolve` → `writer` → (`ops` + `registry`) → `xtdb`, then the writer signals `feed` readers. A meta write takes the same path; the writer also refreshes `registry`, and a breaking change detours through `classify` and `migrate`.
 
 ## Storage (ADR 0001)
 
@@ -33,7 +70,8 @@ A single Clojure service in front of an XTDB2 node. Agents and apps talk to the 
 - Each entity type is stored in its own XTDB table, keyed by an **internal, stable type ID**, not by its public name. This lets a type gain a new name (ADR 0010) without moving data.
 - Entity type definitions are themselves stored in XTDB with valid time, so the definition in force at any point can be read back.
 - Each entity version records the schema version it was written under.
-- Every transaction writes a provenance row in the same transaction: actor, caller kind, reason (where required) and request ID. (To verify: whether XTDB 2.x transaction user-metadata can replace this row.)
+- Every transaction carries provenance: actor, caller kind, reason (where required) and request ID. One small row per transaction, or XTDB transaction user-metadata if 2.x supports it (to verify). Provenance never copies the request.
+- Every entity version carries two system columns, alongside XTDB's own: `_circus/op` (`create`, `update`, `transition`, `repair`) and `_circus/transition` (the transition name, when there is one). With these, every change can be read back from the transaction history without any separate record (ADR 0024).
 
 ## Metamodel (ADR 0003, 0004)
 
@@ -54,7 +92,7 @@ Building blocks:
 
 Definitions are data (EDN internally, JSON at the API), compiled to Malli for validation. Clojure is never exposed to callers.
 
-**Definitions are entities** (ADR 0021). Every definition is an entity of the built-in type `entity`, which has a unique attribute `name`, an `aliases` list (old names, which drive the `308` on rename) and a lifecycle `active ⇄ retired` with transitions `retire` and `revive`. `/m/{type}` is a privileged route onto `/e/entity/...` addressed by name. History, as-of, provenance, events, idempotency and uniqueness come from the same engine. The definition of `entity` itself is the metamodel; it is fixed by the platform and changes only with a platform upgrade.
+**Definitions are entities** (ADR 0021). Every definition is an entity of the built-in type `entity`, which has a unique attribute `name`, an `aliases` list (old names, which drive the `308` on rename) and a lifecycle `active ⇄ retired` with transitions `retire` and `revive`. `/m/{type}` is a privileged route onto `/e/entity/...` addressed by name. History, as-of, provenance, the history feed, idempotency and uniqueness come from the same engine. The definition of `entity` itself is the metamodel; it is fixed by the platform and changes only with a platform upgrade.
 
 Definitions are validated as a whole (**metamodel integrity**): transitions reference declared states, transition names are unique across all lifecycles of the type (ADR 0023), references point at existing types, uniqueness constraints name declared attributes, at most one is the path key, defaults conform to their attribute's type, and a type cannot be renamed or retired in a way that leaves a reference pointing nowhere.
 
@@ -68,7 +106,9 @@ Domain logic is **declarative only** (ADR 0009): types, required fields, ranges,
   "attributes": {
     "submitted-at": {"type": "instant", "required": true},
     "source":       {"type": "enum", "values": ["referral", "inbound", "agency"]},
-    "salary-ask":   {"type": "money"}
+    "salary-ask":   {"type": "money"},
+    "offered-salary":   {"type": "money"},
+    "rejection-reason": {"type": "string"}
   },
   "references": {
     "candidate": {"type": "candidate", "cardinality": "one", "ownership": "associated", "required": true},
@@ -85,10 +125,10 @@ Domain logic is **declarative only** (ADR 0009): types, required fields, ranges,
         "screen":    {"from": ["applied"],                                  "to": "screening"},
         "interview": {"from": ["screening"],                                "to": "interviewing"},
         "offer":     {"from": ["interviewing"],                             "to": "offered",
-                      "payload": {"salary": {"type": "money", "required": true}}},
+                      "sets": {"offered-salary": {"required": true}}},
         "hire":      {"from": ["offered"],                                  "to": "hired"},
         "reject":    {"from": ["applied", "screening", "interviewing", "offered"], "to": "rejected",
-                      "payload": {"reason": {"type": "string", "required": true}}},
+                      "sets": {"rejection-reason": {"required": true}}},
         "withdraw":  {"from": ["applied", "screening", "interviewing", "offered"], "to": "withdrawn"}
       }
     }
@@ -99,7 +139,7 @@ Domain logic is **declarative only** (ADR 0009): types, required fields, ranges,
 ## Lifecycles (ADR 0004)
 
 - A lifecycle declares states, an initial state, terminal states and named transitions.
-- A transition may declare a guard (a predicate over the entity) and a payload schema.
+- A transition may declare a guard (a predicate over the entity) and the attributes it `sets`, each optionally required. A transition's input only ever lands on declared attributes, so it is stored on the entity and nowhere else (ADR 0024). The reason for a privileged change (retire, a breaking change) is provenance, not an attribute.
 - `PATCH` cannot change a lifecycle field; only `POST /e/{type}/{id}/t/{transition}` can.
 - A plain `enum` attribute is allowed and mutable through `PATCH`. It gets none of the above. Lifecycle is the easy path, not the only path; the platform's skills teach agents when to use it.
 
@@ -134,7 +174,7 @@ Examples: renaming or removing a field; narrowing a type or constraint; removing
 
 ### Retiring a type (ADR 0018)
 
-`POST /m/{type}/t/retire` is a transition on the `entity` lifecycle, with a `reason` payload, and a breaking change. Retire means **freeze**: no creates, updates, transitions or further definition changes, but reads, history, queries and inbound references keep working forever. Nothing is removed and the path stays live. The change may include a mapping for inbound references (drop the field, or point it elsewhere), in which case the referencing types are updated in the same transaction; without one, references continue to point at the frozen type.
+`POST /m/{type}/t/retire` is a transition on the `entity` lifecycle and a breaking change; its reason is recorded as provenance. Retire means **freeze**: no creates, updates, transitions or further definition changes, but reads, history, queries and inbound references keep working forever. Nothing is removed and the path stays live. The change may include a mapping for inbound references (drop the field, or point it elsewhere), in which case the referencing types are updated in the same transaction; without one, references continue to point at the frozen type.
 
 `POST /m/{type}/t/revive` reverses it. The type thaws under the definition it was frozen with, and writes resume. Revive is additive: it cannot fail and changes nothing stored. It does not undo a reference mapping applied at retire time; putting those references back is a separate change on the referencing types. Both retire and revive are recorded with a reason and show in the definition's history.
 
@@ -208,16 +248,27 @@ XTDB2 has no uniqueness or foreign-key constraints. In v0 a **single writer** pr
 
 Later: optimistic checks inside transactions (e.g. `ASSERT`), once XTDB support is verified.
 
-## Events (ADR 0015)
+## The history feed (ADR 0015)
 
-The single writer emits an event for every create, update, transition, repair and erasure. Model changes are ordinary events on the `entity` type.
+There is no event subsystem. Every consumer that wants to know what changed (live UIs, reactive business logic, sync jobs, waiting agents, clients watching definitions) asks the same question: changes since cursor X, for the types I care about. That is a history query, at three scopes:
 
-- **SSE stream** with a resumable cursor (`Last-Event-ID`).
-- **Webhooks** registered by subscribers, with retries.
+```
+GET /e/{type}/{id}/history?after={tx}     one entity
+GET /e/{type}/history?after={tx}          one type
+GET /history?after={tx}&type=…            everything, filtered
+```
+
+- The cursor is the XTDB transaction ID. Clients hold their own cursors; we hold no subscriber state.
+- Each change is rendered from the transaction history: the entity version, `_circus/op`, `_circus/transition`, and provenance.
+- **SSE** is `Accept: text/event-stream` on the same URLs: the same query, held open. `Last-Event-ID` is the cursor.
+- **Long-poll** is `?wait=30s` on the same URLs, for agents waiting on a condition.
+- Definition changes are the history of `/e/entity`.
+- After a commit the writer signals waiting readers to look again. The signal carries nothing; readers would be correct polling without it. The writer never waits on readers.
+- **Webhooks are deferred.** If a consumer must be pushed to, a webhook dispatcher is one more reader of the feed holding its own cursor; nothing underneath changes.
 
 ## Erasure (ADR 0019)
 
-Attributes marked sensitive can be erased for an entity with XTDB `ERASE`, leaving the rest of its history intact. Erasure covers what we store. Values already delivered through events, webhooks, dry-run samples or exports are the recipient's obligation; we emit an `erased` event so they can act. After erasure, replayed events simply lack the field.
+Attributes marked sensitive can be erased for an entity with XTDB `ERASE`, leaving the rest of its history intact. Erasure covers what we store. Values already delivered through the history feed, dry-run samples or exports are the recipient's obligation. Erasure is itself a change in the history feed, so readers can act on it. Because the feed renders from stored versions, replaying it after erasure simply lacks the field. (To verify: XTDB 2.x log retention, since the underlying log holds original transaction payloads.)
 
 ## Deployment (ADR 0014)
 
@@ -229,7 +280,8 @@ Single tenant: one circus per deployment.
 - A revert API (`revert-to?valid-at=` for entities and definitions), so "recoverable" can become "reversible".
 - Can model changes be scheduled for a future valid time?
 - How long does a renamed type's `308` last, and who decides?
-- Webhook delivery guarantees, signing and subscription management.
+- Webhooks, if a consumer turns up that cannot pull: delivery guarantees, signing, subscription management.
 - JSONata implementation on the JVM (candidate: dashjoin `jsonata-java`), and limits on time and memory.
-- XTDB 2.x specifics to verify: transaction user-metadata, `ASSERT`, erasure behaviour, and XTQL vs SQL as the compile target.
+- XTDB 2.x specifics to verify: transaction user-metadata, `ASSERT`, erasure behaviour and log retention, and XTQL vs SQL as the compile target.
+- Refusals (rejected writes) go to the structured application log, not XTDB. Revisit if auditors need them queryable.
 - Atomic application of breaking changes and large batches over very large data sets.

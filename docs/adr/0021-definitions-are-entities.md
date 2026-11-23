@@ -8,10 +8,10 @@ The meta API and the data API grew separately and had drifted: bespoke endpoints
 ## Decision
 An entity type definition is an entity of a built-in type named `entity`. `/m/{type}` is a privileged route onto `/e/entity/...`, addressed by name, not a separate API.
 
-- `entity` has a unique attribute `name`, and a lifecycle `active ⇄ retired` with transitions `retire` and `revive`, each taking a `reason` payload.
+- `entity` has a unique attribute `name`, and a lifecycle `active ⇄ retired` with transitions `retire` and `revive`, whose reason is recorded as provenance.
 - Additive changes are `PATCH /m/{type}`. A patch whose diff is breaking is refused with a pointer to the breaking endpoint.
 - Retire and revive are `POST /m/{type}/t/retire` and `/t/revive`.
-- `GET /m/{type}/history`, `?valid-at=`, provenance, events, `Idempotency-Key` and uniqueness all come from the same engine.
+- `GET /m/{type}/history`, `?valid-at=`, provenance, the history feed, `Idempotency-Key` and uniqueness all come from the same engine.
 - `/batch` accepts definition operations with temporary IDs, so mutually referencing types can be created in one transaction.
 - `?dry-run=true` is accepted on every write, data and meta. The breaking endpoint requires it before confirm.
 - The definition of `entity` itself (the metamodel) is fixed by the platform and changes only with a platform upgrade. The recursion stops there.
@@ -22,5 +22,5 @@ The two justified differences that remain:
 
 ## Consequences
 - One engine, two routes. Less code, fewer generators, and the circus runs its own machinery against its own definitions from day one.
-- Model-change events are ordinary events on `entity`.
+- Model changes appear in the history feed as changes to `entity`.
 - A rename is data: `name` changes and the old name goes into `aliases`, which drives the `308`.

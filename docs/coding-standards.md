@@ -5,7 +5,7 @@ Status: accepted, 2026-11-23. These apply to every contributor, human or agent. 
 ## Namespaces
 
 - The root namespace is `the-circus`. Declare it as `(ns the-circus)` and use it; never `the-circus.core`. No namespace anywhere is called `core`.
-- Layout is by concern, not by layer: `the-circus.metamodel`, `the-circus.writer`, `the-circus.http`, `the-circus.events`. Not `handlers`, `models`, `utils`.
+- Layout is by concern, not by layer: `the-circus.metamodel`, `the-circus.writer`, `the-circus.http`, `the-circus.feed`. Not `handlers`, `models`, `utils`.
 - One namespace per file; the file path mirrors the namespace.
 
 ## Tooling
@@ -36,7 +36,7 @@ Status: accepted, 2026-11-23. These apply to every contributor, human or agent. 
 ## Functions
 
 - Every public var has a docstring that says what it returns and what it throws. Private vars may have one.
-- Prefer pure functions; push effects to the edges (the writer, the HTTP layer, the event hub). A function that touches XTDB says so in its name or its namespace.
+- Prefer pure functions; push effects to the edges (the writer, the HTTP layer). A function that touches XTDB says so in its name or its namespace.
 - No `declare` to dodge ordering; order the file so it reads top-down.
 
 ## Comments

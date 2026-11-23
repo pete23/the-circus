@@ -13,4 +13,4 @@ There is no cap on the number of operations. A safety limit of 100 MB compressed
 ## Consequences
 - XTDB's multi-table transactions do the heavy lifting.
 - A second write shape for generators (OpenAPI, MCP) to support.
-- Eventual consistency via events remains available but is not the only option.
+- Eventual consistency via the history feed remains available but is not the only option.
