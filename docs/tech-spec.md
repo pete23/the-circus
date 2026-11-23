@@ -133,6 +133,8 @@ Examples: renaming or removing a field; narrowing a type or constraint; removing
 
 `POST /m/{type}/retire` is a breaking change. Retire means **freeze**: no creates, updates, transitions or further definition changes, but reads, history, queries and inbound references keep working forever. Nothing is removed and the path stays live. The change may include a mapping for inbound references (drop the field, or point it elsewhere), in which case the referencing types are updated in the same transaction; without one, references continue to point at the frozen type.
 
+`POST /m/{type}/revive` reverses it. The type thaws under the definition it was frozen with, and writes resume. Revive is additive: it cannot fail and changes nothing stored. It does not undo a reference mapping applied at retire time; putting those references back is a separate change on the referencing types. Both retire and revive are recorded with a reason and show in the definition's history.
+
 ## API (ADR 0008)
 
 Every entity type has the same API shape. Typed OpenAPI is generated per type.
@@ -160,6 +162,7 @@ GET    /m/{type}                          definition (supports as-of)
 POST   /m/{type}/changes                  API A: additive
 POST   /m/{type}/breaking-changes         API B: breaking, with dry run and confirm
 POST   /m/{type}/retire                   API B: freeze the type
+POST   /m/{type}/revive                   thaw a retired type
 GET    /m/{type}/openapi.json             generated OpenAPI (supports as-of)
 ```
 
