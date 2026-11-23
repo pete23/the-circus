@@ -54,6 +54,8 @@ Building blocks:
 
 Definitions are data (EDN internally, JSON at the API), compiled to Malli for validation. Clojure is never exposed to callers.
 
+**Definitions are entities** (ADR 0021). Every definition is an entity of the built-in type `entity`, which has a unique attribute `name`, an `aliases` list (old names, which drive the `308` on rename) and a lifecycle `active ⇄ retired` with transitions `retire` and `revive`. `/m/{type}` is a privileged route onto `/e/entity/...` addressed by name. History, as-of, provenance, events, idempotency and uniqueness come from the same engine. The definition of `entity` itself is the metamodel; it is fixed by the platform and changes only with a platform upgrade.
+
 Definitions are validated as a whole (**metamodel integrity**): transitions reference declared states, references point at existing types, uniqueness constraints name declared attributes, defaults conform to their attribute's type, and a type cannot be renamed or retired in a way that leaves a reference pointing nowhere.
 
 Domain logic is **declarative only** (ADR 0009): types, required fields, ranges, uniqueness, referential integrity and transition guards as simple predicates. Anything richer lives in the apps built on top.
@@ -108,9 +110,9 @@ Lifecycle states, enum values and defaults are part of the definition, and the d
 
 A change is **additive** if it cannot fail and cannot change the meaning of any existing row or any previously valid request. Anything else is **breaking**. The service classifies each submitted change and rejects one sent to the wrong API.
 
-### API A: additive changes, `POST /m/{type}/changes`
+### API A: additive changes, `PATCH /m/{type}`
 
-Examples: a new optional field; a new required field with a declared default; a new state or enum value; a new transition; widening a constraint.
+A patch whose diff is breaking is refused with a pointer to the breaking endpoint. Examples: a new optional field; a new required field with a declared default; a new state or enum value; a new transition; widening a constraint.
 
 Additive changes may write data in one case: a new required field with a default is **materialised** onto every existing entity when the change is applied, as a new version valid from the apply time and attributed to the meta-transaction. A default is applied at write time whenever the field is omitted (on create, and once on apply for existing rows). Changing a default later affects only future writes. Stored data therefore always literally conforms, and queries never need null handling.
 
@@ -121,8 +123,8 @@ Examples: renaming or removing a field; narrowing a type or constraint; removing
 - The request must include a **reason** and a **caller flag** (`Circus-Breaking: acknowledged` header), both recorded with the transaction. This is the first privilege gate, before identity exists.
 - It may include a **JSONata transformation** from old entity shape to new.
 - **Removing a lifecycle state requires a state mapping** (old state → new state) in the change. This is checked up front, so a lifecycle change can never leave an entity in a state that no longer exists.
-- We **dry-run** the change: apply the transformation (if any) to every current and future-valid version of every entity of that type, then validate against the new definition. The response reports how many entities were checked, fixed and left invalid, with sample failures.
-- The caller can then confirm. On confirmation the definition change and all transformed entities are written in one transaction.
+- A **dry run** is required first (`?dry-run=true`, available on every write but mandatory here): apply the transformation (if any) to every current and future-valid version of every entity of that type, then validate against the new definition. The response reports how many entities were checked, fixed and left invalid, with sample failures, and a confirmation token.
+- The caller can then confirm with the token. On confirmation the definition change and all transformed entities are written in one transaction.
 - History is not rewritten: past versions remain valid under the definition in force at their valid time.
 - Entities still invalid after the change go onto a **worklist** (`GET /e/{type}/non-conforming`).
 - Invalid entities must be fixed first: no `PATCH` or transition is allowed until the entity is valid, including transitions to terminal states. The fix goes through `POST /e/{type}/{id}/repair`, which is allowed only on worklist entities, may set any field including lifecycle fields, must produce a valid entity, and is recorded as a repair with actor and reason.
@@ -131,9 +133,9 @@ Examples: renaming or removing a field; narrowing a type or constraint; removing
 
 ### Retiring a type (ADR 0018)
 
-`POST /m/{type}/retire` is a breaking change. Retire means **freeze**: no creates, updates, transitions or further definition changes, but reads, history, queries and inbound references keep working forever. Nothing is removed and the path stays live. The change may include a mapping for inbound references (drop the field, or point it elsewhere), in which case the referencing types are updated in the same transaction; without one, references continue to point at the frozen type.
+`POST /m/{type}/t/retire` is a transition on the `entity` lifecycle, with a `reason` payload, and a breaking change. Retire means **freeze**: no creates, updates, transitions or further definition changes, but reads, history, queries and inbound references keep working forever. Nothing is removed and the path stays live. The change may include a mapping for inbound references (drop the field, or point it elsewhere), in which case the referencing types are updated in the same transaction; without one, references continue to point at the frozen type.
 
-`POST /m/{type}/revive` reverses it. The type thaws under the definition it was frozen with, and writes resume. Revive is additive: it cannot fail and changes nothing stored. It does not undo a reference mapping applied at retire time; putting those references back is a separate change on the referencing types. Both retire and revive are recorded with a reason and show in the definition's history.
+`POST /m/{type}/t/revive` reverses it. The type thaws under the definition it was frozen with, and writes resume. Revive is additive: it cannot fail and changes nothing stored. It does not undo a reference mapping applied at retire time; putting those references back is a separate change on the referencing types. Both retire and revive are recorded with a reason and show in the definition's history.
 
 ## API (ADR 0008)
 
@@ -157,24 +159,29 @@ POST   /batch                             several ops across types, all-or-nothi
 ### Meta plane
 
 ```
-GET    /m                                 list entity types
+GET    /m                                 list entity types (= query on entity)
+POST   /m                                 create a type (= create on entity)
 GET    /m/{type}                          definition (supports as-of)
-POST   /m/{type}/changes                  API A: additive
+PATCH  /m/{type}                          API A: additive
 POST   /m/{type}/breaking-changes         API B: breaking, with dry run and confirm
-POST   /m/{type}/retire                   API B: freeze the type
-POST   /m/{type}/revive                   thaw a retired type
+POST   /m/{type}/t/retire                 API B: freeze the type
+POST   /m/{type}/t/revive                 thaw a retired type
+GET    /m/{type}/history                  definition versions across both time axes
 GET    /m/{type}/openapi.json             generated OpenAPI (supports as-of)
 ```
 
+`/m/{type}` is a privileged route onto `/e/entity/{id}`, addressed by name. The only meta-shaped things are the breaking endpoint (its validation scope is every row of the type, hence transformation, dry run and confirm) and the fixed bootstrap definition of `entity`.
+
 - `/e` and `/m` are separate entry points so privilege can be enforced by path before fine-grained rules exist.
 - No `/v1` in paths: definitions are versioned in time, so clients pin by as-of.
-- Entity type names are lowercase kebab-case and immutable. A "rename" creates a new name; the old path answers `308` to the new one for a declared period (ADR 0010).
+- Entity type names are lowercase kebab-case. A rename sets a new `name` and appends the old one to `aliases`; an alias path answers `308` to the current name for a declared period (ADR 0010).
 - Creates accept an `Idempotency-Key` header; a repeated key returns the original result.
+- Every write accepts `?dry-run=true`: full validation, nothing written, the response is what the real write would return.
 - Errors use `application/problem+json`.
 
 ### Batch (ADR 0017)
 
-`POST /batch` takes an ordered list of operations (create, update, transition) across any entity types. A create may declare a temporary ID (`"$id": "c1"`) that later operations in the same batch reference. Every operation is validated against the current definitions before anything is submitted, then the whole batch is written in one XTDB transaction. It cannot half-apply. There is no cap on the number of operations; a safety limit of 100 MB compressed applies to the payload, to be revisited once we see what XTDB tolerates.
+`POST /batch` takes an ordered list of operations (create, update, transition) across any entity types, including `entity` itself, so mutually referencing definitions can be created together. A create may declare a temporary ID (`"$id": "c1"`) that later operations in the same batch reference. Every operation is validated against the current definitions before anything is submitted, then the whole batch is written in one XTDB transaction. It cannot half-apply. There is no cap on the number of operations; a safety limit of 100 MB compressed applies to the payload, to be revisited once we see what XTDB tolerates.
 
 ### Queries (ADR 0016)
 
@@ -200,7 +207,7 @@ Later: optimistic checks inside transactions (e.g. `ASSERT`), once XTDB support 
 
 ## Events (ADR 0015)
 
-The single writer emits an event for every create, update, transition, repair, erasure and model change.
+The single writer emits an event for every create, update, transition, repair and erasure. Model changes are ordinary events on the `entity` type.
 
 - **SSE stream** with a resumable cursor (`Last-Event-ID`).
 - **Webhooks** registered by subscribers, with retries.
