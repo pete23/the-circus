@@ -10,8 +10,9 @@ A change is **additive** if it cannot fail and cannot change the meaning of any 
 
 - `PATCH /m/{type}` accepts additive changes only; a breaking diff is refused with a pointer to the breaking endpoint. A new required field with a default is additive: the default is **materialised** onto every existing entity on apply, as a new version attributed to the meta-transaction. Defaults are applied at write time when a field is omitted; changing a default later affects only future writes. Stored data always literally conforms.
 - `POST /m/{type}/breaking-changes` accepts breaking changes. It requires a reason and a caller flag, may include a JSONata transformation (0006), is dry-run before confirmation, and reports what will break for both data and clients.
-- **Removing a lifecycle state requires a state mapping** in the change, checked up front. A lifecycle change can never leave an entity in a state that no longer exists.
-- Entities still invalid after a breaking change go onto a worklist. They must be fixed before any other write or any transition, including to a terminal state. The fix is `POST /e/{type}/{id}/repair`: allowed only on worklist entities, may set any field including lifecycle fields, must produce a valid entity, recorded with actor and reason.
+- **Removing a machine state requires a state mapping** in the change, checked up front. A machine change can never leave an entity in a state that no longer exists.
+- Additive changes to a named machine apply to every type that attaches it. Breaking changes to a machine attached to more than one type are refused in v0; fork the machine and move each type across instead (0025).
+- Entities still invalid after a breaking change go onto a worklist. They must be fixed before any other write or any transition, including to a terminal state. The fix is `POST /e/{type}/{id}/repair`: allowed only on worklist entities, may set any field including machine instances, must produce a valid entity, recorded with actor and reason.
 - History is not rewritten; past versions stay valid under the definition in force at their valid time.
 - v0 changes touch one entity type at a time.
 

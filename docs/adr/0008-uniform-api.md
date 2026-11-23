@@ -6,8 +6,9 @@ Status: accepted, 2026-11-23 (revised same day)
 Entity types are the unit of the contract. Agents and the apps they build benefit from every type looking the same.
 
 ## Decision
-- Data plane at `/e/{type}`: query, create, read, update, transition (`/t/{transition}`), repair, history, worklist. Plus `/batch` for multi-entity, all-or-nothing writes (0017).
-- Meta plane at `/m/{type}`: a privileged route onto the built-in `entity` type (0021). Definition, `PATCH` for additive changes, breaking changes, `/t/retire`, `/t/revive`, history, generated OpenAPI.
+- Data plane at `/e/{type}`: query, create, read, update, transition (`/t/{field}/{transition}`), repair, history, worklist. Plus `/batch` for multi-entity, all-or-nothing writes (0017).
+- Meta plane at `/m/{type}`: a privileged route onto the built-in `entity` type (0021). Definition, `PATCH` for additive changes, breaking changes, `/t/status/retire`, `/t/status/revive`, history, generated OpenAPI.
+- State machine plane at `/s/{machine}`: a privileged route onto the built-in `machine` type (0025), with the same shape.
 - Same shape for every type; typed OpenAPI and MCP schemas are generated from definitions.
 - No version in paths; definitions are versioned in time and clients pin by as-of.
 - Creates accept an `Idempotency-Key` header. Every write accepts `?dry-run=true`.
