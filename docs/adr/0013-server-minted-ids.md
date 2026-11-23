@@ -9,6 +9,7 @@ IDs can be minted by us or supplied by callers. Natural keys (email, employee nu
 - We mint every entity ID as a UUIDv7. There is no separate identity block in the metamodel; natural keys are uniqueness constraints on attributes.
 - A uniqueness constraint holds **at any instant of valid time**: two entities cannot share the value during overlapping valid periods. Reuse after one period ends is allowed. The single writer checks every write against currently-valid and future-valid rows.
 - Idempotent creates use an `Idempotency-Key` header.
+- One single-attribute uniqueness constraint may be the type's path key, making `/e/{type}/{key}` addressable (0022).
 
 ## Consequences
 - IDs are uniform, time-ordered and never chosen by an agent.

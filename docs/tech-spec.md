@@ -45,7 +45,7 @@ Building blocks:
 | --- | --- |
 | Entity type | Named, versioned. The name is its URL path segment. |
 | Attribute | From a closed set of types (string, integer, decimal, boolean, date, instant, enum, money, quantity-with-unit, ...). Required or optional, with simple constraints (range, length, pattern) and an optional default. |
-| Uniqueness | One or more attributes that must be unique at any instant of valid time (ADR 0013). Natural keys live here; IDs are always minted by us. |
+| Uniqueness | One or more attributes that must be unique at any instant of valid time (ADR 0013). Natural keys live here; IDs are always minted by us. One single-attribute constraint may be marked as the `path-key` (ADR 0022). |
 | Reference | To another entity type, with cardinality and ownership (owned vs associated). |
 | Lifecycle | A state field with declared states, named transitions and optional guards. Only changeable through transitions. The idiomatic home for anything with states (ADR 0004). |
 | Time semantics | Marks attributes whose valid time is business-meaningful (e.g. an effective date), as opposed to bookkeeping. |
@@ -56,7 +56,7 @@ Definitions are data (EDN internally, JSON at the API), compiled to Malli for va
 
 **Definitions are entities** (ADR 0021). Every definition is an entity of the built-in type `entity`, which has a unique attribute `name`, an `aliases` list (old names, which drive the `308` on rename) and a lifecycle `active ⇄ retired` with transitions `retire` and `revive`. `/m/{type}` is a privileged route onto `/e/entity/...` addressed by name. History, as-of, provenance, events, idempotency and uniqueness come from the same engine. The definition of `entity` itself is the metamodel; it is fixed by the platform and changes only with a platform upgrade.
 
-Definitions are validated as a whole (**metamodel integrity**): transitions reference declared states, references point at existing types, uniqueness constraints name declared attributes, defaults conform to their attribute's type, and a type cannot be renamed or retired in a way that leaves a reference pointing nowhere.
+Definitions are validated as a whole (**metamodel integrity**): transitions reference declared states, transition names are unique across all lifecycles of the type (ADR 0023), references point at existing types, uniqueness constraints name declared attributes, at most one is the path key, defaults conform to their attribute's type, and a type cannot be renamed or retired in a way that leaves a reference pointing nowhere.
 
 Domain logic is **declarative only** (ADR 0009): types, required fields, ranges, uniqueness, referential integrity and transition guards as simple predicates. Anything richer lives in the apps built on top.
 
@@ -75,6 +75,7 @@ Domain logic is **declarative only** (ADR 0009): types, required fields, ranges,
     "opening":   {"type": "opening",   "cardinality": "one", "ownership": "associated", "required": true}
   },
   "unique": [["candidate", "opening"]],
+  "path-key": null,
   "lifecycles": {
     "status": {
       "initial": "applied",
@@ -170,10 +171,12 @@ GET    /m/{type}/history                  definition versions across both time a
 GET    /m/{type}/openapi.json             generated OpenAPI (supports as-of)
 ```
 
-`/m/{type}` is a privileged route onto `/e/entity/{id}`, addressed by name. The only meta-shaped things are the breaking endpoint (its validation scope is every row of the type, hence transformation, dry run and confirm) and the fixed bootstrap definition of `entity`.
+`/m/{type}` is a privileged route onto `/e/entity/{id}`, where `name` is `entity`'s path key (ADR 0022). The only meta-shaped things are the breaking endpoint (its validation scope is every row of the type, hence transformation, dry run and confirm) and the fixed bootstrap definition of `entity`.
 
 - `/e` and `/m` are separate entry points so privilege can be enforced by path before fine-grained rules exist.
 - No `/v1` in paths: definitions are versioned in time, so clients pin by as-of.
+- `{id}` in every data-plane path is either the UUID or, if the type declares a `path-key`, a value of that key (ADR 0022). A UUID-shaped segment is always an ID; path-key values may not be UUID-shaped. With `?valid-at=` a key resolves to its holder at that instant. No current holder gives `404` with who last held it and until when. References always store UUIDs.
+- Transition names are unique per type across all its lifecycles (ADR 0023), so `/t/{transition}` is never ambiguous.
 - Entity type names are lowercase kebab-case. A rename sets a new `name` and appends the old one to `aliases`; an alias path answers `308` to the current name for a declared period (ADR 0010).
 - Creates accept an `Idempotency-Key` header; a repeated key returns the original result.
 - Every write accepts `?dry-run=true`: full validation, nothing written, the response is what the real write would return.
