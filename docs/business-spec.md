@@ -18,10 +18,12 @@ Agents now build business software. They design schemas, write migrations, wire 
 
 - **We decide how data is modelled.** Entity types are defined in our metamodel, which captures what standard schema languages leave out: identity, lifecycles, references, time semantics, money and units, sensitivity and provenance.
 - **Where the data implies a state machine, we implement it.** Status changes happen only through named transitions that we enforce.
-- **Every change is recorded and reversible in time.** Storage is append-only and bitemporal: any entity, and the definition it was valid under, can be read as of any point in time.
+- **Every change is recorded and recoverable.** Storage is append-only and bitemporal: any entity, and the definition it was valid under, can be read as of any point in time. Nothing is ever deleted; a retired entity type is frozen, not dropped.
 - **Changing the model is managed too.** Changes to an entity type's definition go through us, and must declare themselves as either additive (nothing breaks) or breaking (data or clients may break). Breaking changes are explicit, explained and leave a worklist of anything that needs fixing.
 
 Agents build whatever they like on top: UIs, business logic, integrations. That is not our concern. Because everything underneath is constrained and well understood, what they build is too.
+
+We do not prohibit bad modelling; we make good modelling the easy path and ship the **skills** that teach agents the idioms. Canalising agents is partly a documentation product.
 
 ## What it is not
 
@@ -51,13 +53,13 @@ Agents build whatever they like on top: UIs, business logic, integrations. That 
 A hiring pipeline has long lifecycles, plenty of references and plenty of personal data. The demo will show:
 
 1. An agent defines the model: job openings, candidates, applications, interviews, offers.
-2. An agent builds a throwaway UI on the generated API. Applications move through their lifecycle only by named transitions.
+2. An agent builds a throwaway UI on the generated API. Applications move through their lifecycle only by named transitions; the UI's dropdowns come from the definition, not from code. Accepting an offer closes the opening and rejects the other applications in one atomic batch.
 3. An **additive change**: a new optional field, or a new state that existing records can ignore. Nothing breaks.
 4. A **breaking change with a transformation**: e.g. splitting a candidate's name into given and family names, migrated by a JSONata expression we dry-run before applying.
 5. A **breaking change that invalidates data**: e.g. a new rule that offers require right-to-work verification. Existing offers are flagged on a worklist and must be fixed before they can move on.
 6. **Time travel**: the pipeline, and the model it ran under, as of last Tuesday.
 7. **Erasure**: a candidate's personal data is erased on request, with the rest of the history intact.
-8. **The `DROP TABLE` moment**: an agent's destructive intent comes out as a recorded, attributed, reversible change, or not at all.
+8. **The `DROP TABLE` moment**: an agent asks to drop a type. It gets a frozen, fully readable, attributed retirement that needed a stated reason, or nothing at all.
 
 ## What success looks like
 

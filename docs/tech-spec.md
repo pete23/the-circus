@@ -10,7 +10,7 @@ A single Clojure service in front of an XTDB2 node. Agents and apps talk to the 
  builder agents / spec authors      apps, runtime agents
             │                              │
             ▼                              ▼
-     meta API  /m/{type}            data API  /e/{type}
+     meta API  /m/{type}            data API  /e/{type}, /batch
             │          MCP server          │
             └──────────────┬───────────────┘
                            ▼
@@ -44,45 +44,94 @@ Building blocks:
 | Block | Purpose |
 | --- | --- |
 | Entity type | Named, versioned. The name is its URL path segment. |
-| Attribute | From a closed set of types (string, integer, decimal, boolean, date, instant, enum, money, quantity-with-unit, ...). Required or optional, with simple constraints (range, length, pattern). |
-| Identity | Every entity has a server-minted UUIDv7 ID (ADR 0013). Natural keys are expressed as uniqueness constraints. |
+| Attribute | From a closed set of types (string, integer, decimal, boolean, date, instant, enum, money, quantity-with-unit, ...). Required or optional, with simple constraints (range, length, pattern) and an optional default. |
+| Uniqueness | One or more attributes that must be unique at any instant of valid time (ADR 0013). Natural keys live here; IDs are always minted by us. |
 | Reference | To another entity type, with cardinality and ownership (owned vs associated). |
-| Lifecycle | A state field with declared states, named transitions and optional guards. Only changeable through transitions. |
+| Lifecycle | A state field with declared states, named transitions and optional guards. Only changeable through transitions. The idiomatic home for anything with states (ADR 0004). |
 | Time semantics | Marks attributes whose valid time is business-meaningful (e.g. an effective date), as opposed to bookkeeping. |
-| Sensitivity | Marks personal data, which drives erasure. |
+| Sensitivity | Marks personal data, which drives erasure (ADR 0019). |
 | Provenance | Recorded on every change; not declared per type. |
 
 Definitions are data (EDN internally, JSON at the API), compiled to Malli for validation. Clojure is never exposed to callers.
 
+Definitions are validated as a whole (**metamodel integrity**): transitions reference declared states, references point at existing types, uniqueness constraints name declared attributes, defaults conform to their attribute's type, and a type cannot be renamed or retired in a way that leaves a reference pointing nowhere.
+
 Domain logic is **declarative only** (ADR 0009): types, required fields, ranges, uniqueness, referential integrity and transition guards as simple predicates. Anything richer lives in the apps built on top.
+
+### Example definition
+
+```json
+{
+  "name": "application",
+  "attributes": {
+    "submitted-at": {"type": "instant", "required": true},
+    "source":       {"type": "enum", "values": ["referral", "inbound", "agency"]},
+    "salary-ask":   {"type": "money"}
+  },
+  "references": {
+    "candidate": {"type": "candidate", "cardinality": "one", "ownership": "associated", "required": true},
+    "opening":   {"type": "opening",   "cardinality": "one", "ownership": "associated", "required": true}
+  },
+  "unique": [["candidate", "opening"]],
+  "lifecycles": {
+    "status": {
+      "initial": "applied",
+      "states": ["applied", "screening", "interviewing", "offered", "hired", "rejected", "withdrawn"],
+      "terminal": ["hired", "rejected", "withdrawn"],
+      "transitions": {
+        "screen":    {"from": ["applied"],                                  "to": "screening"},
+        "interview": {"from": ["screening"],                                "to": "interviewing"},
+        "offer":     {"from": ["interviewing"],                             "to": "offered",
+                      "payload": {"salary": {"type": "money", "required": true}}},
+        "hire":      {"from": ["offered"],                                  "to": "hired"},
+        "reject":    {"from": ["applied", "screening", "interviewing", "offered"], "to": "rejected",
+                      "payload": {"reason": {"type": "string", "required": true}}},
+        "withdraw":  {"from": ["applied", "screening", "interviewing", "offered"], "to": "withdrawn"}
+      }
+    }
+  }
+}
+```
 
 ## Lifecycles (ADR 0004)
 
-- Any status-like field must be declared as a lifecycle: states, an initial state, terminal states and named transitions.
+- A lifecycle declares states, an initial state, terminal states and named transitions.
 - A transition may declare a guard (a predicate over the entity) and a payload schema.
 - `PATCH` cannot change a lifecycle field; only `POST /e/{type}/{id}/t/{transition}` can.
+- A plain `enum` attribute is allowed and mutable through `PATCH`. It gets none of the above. Lifecycle is the easy path, not the only path; the platform's skills teach agents when to use it.
+
+## Clients and definitions (ADR 0020)
+
+Lifecycle states, enum values and defaults are part of the definition, and the definition is readable at any time (`GET /m/{type}`, as-of if needed). Clients derive enumerations from the definition rather than hard-coding them: a dropdown is populated from `/m/application`, not from a constant. A client that hard-codes states has broken the contract, not us. This is what makes new states and new enum values additive.
 
 ## Changing the model (ADR 0005, 0006)
 
-A change is **additive** if every previously valid entity and every previously valid request is still valid afterwards. Anything else is **breaking**. The service classifies each submitted change and rejects one sent to the wrong API.
+A change is **additive** if it cannot fail and cannot change the meaning of any existing row or any previously valid request. Anything else is **breaking**. The service classifies each submitted change and rejects one sent to the wrong API.
 
 ### API A: additive changes, `POST /m/{type}/changes`
 
-Examples: a new optional field; a new required field with a server-side default; a new state reachable by a new transition; widening a constraint. Applied immediately; nothing breaks.
+Examples: a new optional field; a new required field with a declared default; a new state or enum value; a new transition; widening a constraint.
+
+Additive changes may write data in one case: a new required field with a default is **materialised** onto every existing entity when the change is applied, as a new version valid from the apply time and attributed to the meta-transaction. A default is applied at write time whenever the field is omitted (on create, and once on apply for existing rows). Changing a default later affects only future writes. Stored data therefore always literally conforms, and queries never need null handling.
 
 ### API B: breaking changes, `POST /m/{type}/breaking-changes`
 
-Examples: renaming or removing a field; narrowing a type or constraint; removing a state or transition; adding a guard.
+Examples: renaming or removing a field; narrowing a type or constraint; removing a state or transition; adding a guard; retiring the type.
 
-- The request must include a **reason** and a **caller flag**, both recorded with the transaction. This is the first privilege gate, before identity exists.
+- The request must include a **reason** and a **caller flag** (`Circus-Breaking: acknowledged` header), both recorded with the transaction. This is the first privilege gate, before identity exists.
 - It may include a **JSONata transformation** from old entity shape to new.
+- **Removing a lifecycle state requires a state mapping** (old state → new state) in the change. This is checked up front, so a lifecycle change can never leave an entity in a state that no longer exists.
 - We **dry-run** the change: apply the transformation (if any) to every current and future-valid version of every entity of that type, then validate against the new definition. The response reports how many entities were checked, fixed and left invalid, with sample failures.
 - The caller can then confirm. On confirmation the definition change and all transformed entities are written in one transaction.
 - History is not rewritten: past versions remain valid under the definition in force at their valid time.
 - Entities still invalid after the change go onto a **worklist** (`GET /e/{type}/non-conforming`).
-- Invalid entities must be fixed first: every write to one must produce a valid entity, and no transition (including to a terminal state) is allowed until it is valid.
-- The response also says that clients will break, and how (fields renamed, removed, newly required).
+- Invalid entities must be fixed first: no `PATCH` or transition is allowed until the entity is valid, including transitions to terminal states. The fix goes through `POST /e/{type}/{id}/repair`, which is allowed only on worklist entities, may set any field including lifecycle fields, must produce a valid entity, and is recorded as a repair with actor and reason.
+- The response also says how clients will break (fields renamed, removed, newly required; states removed).
 - v0 changes touch one entity type at a time. Transformations across types (splitting an entity, moving a field across a reference) are out of scope.
+
+### Retiring a type (ADR 0018)
+
+`POST /m/{type}/retire` is a breaking change. Retire means **freeze**: no creates, updates, transitions or further definition changes, but reads, history, queries and inbound references keep working forever. Nothing is removed and the path stays live. The change may include a mapping for inbound references (drop the field, or point it elsewhere), in which case the referencing types are updated in the same transaction; without one, references continue to point at the frozen type.
 
 ## API (ADR 0008)
 
@@ -97,8 +146,10 @@ POST   /e/{type}                          create (we mint the ID)
 GET    /e/{type}/{id}                     read (supports as-of)
 PATCH  /e/{type}/{id}                     update (not lifecycle fields)
 POST   /e/{type}/{id}/t/{transition}      lifecycle transition
+POST   /e/{type}/{id}/repair              fix a non-conforming entity
 GET    /e/{type}/{id}/history             versions across both time axes
 GET    /e/{type}/non-conforming           worklist after breaking changes
+POST   /batch                             several ops across types, all-or-nothing
 ```
 
 ### Meta plane
@@ -108,23 +159,29 @@ GET    /m                                 list entity types
 GET    /m/{type}                          definition (supports as-of)
 POST   /m/{type}/changes                  API A: additive
 POST   /m/{type}/breaking-changes         API B: breaking, with dry run and confirm
+POST   /m/{type}/retire                   API B: freeze the type
 GET    /m/{type}/openapi.json             generated OpenAPI (supports as-of)
 ```
 
 - `/e` and `/m` are separate entry points so privilege can be enforced by path before fine-grained rules exist.
 - No `/v1` in paths: definitions are versioned in time, so clients pin by as-of.
 - Entity type names are lowercase kebab-case and immutable. A "rename" creates a new name; the old path answers `308` to the new one for a declared period (ADR 0010).
+- Creates accept an `Idempotency-Key` header; a repeated key returns the original result.
 - Errors use `application/problem+json`.
+
+### Batch (ADR 0017)
+
+`POST /batch` takes an ordered list of operations (create, update, transition) across any entity types. A create may declare a temporary ID (`"$id": "c1"`) that later operations in the same batch reference. Every operation is validated against the current definitions before anything is submitted, then the whole batch is written in one XTDB transaction. It cannot half-apply. There is no cap on the number of operations; a safety limit of 100 MB compressed applies to the payload, to be revisited once we see what XTDB tolerates.
 
 ### Queries (ADR 0016)
 
 - The structured query is JSON in our own vocabulary: filters (and/or/not, comparisons, `in`), following references (`include`), sorting, paging, both time axes, and `count` and `group-by` aggregation.
-- It compiles to XTQL. No SQL or XTQL is ever accepted from callers.
+- It compiles to XTDB's query language (XTQL or SQL; to verify which is the better target in current 2.x). No SQL or XTQL is ever accepted from callers.
 - Unsupported operations get a clear refusal, not a workaround.
 
 ### MCP (ADR 0011)
 
-A fixed set of generic tools that take an entity type (`list_types`, `describe_type`, `query`, `create`, `update`, `transition`, `history`, `propose_change`, ...). Each type's generated schema is published as an MCP resource, so the tool count doesn't grow with the model.
+A fixed set of generic tools that take an entity type (`list_types`, `describe_type`, `query`, `create`, `update`, `transition`, `batch`, `history`, `propose_change`, ...). Each type's generated schema is published as an MCP resource, so the tool count doesn't grow with the model. The server also publishes **skills**: instructions resources that teach agents the idioms (when a field is a lifecycle, how to classify a change, how to read a definition before writing).
 
 ## Access (ADR 0012)
 
@@ -134,16 +191,20 @@ Identity and privilege are deferred, but every transaction records an actor from
 
 ## Writes and integrity (ADR 0007)
 
-XTDB2 has no uniqueness or foreign-key constraints. In v0 a **single writer** process serialises all writes, data and meta: it validates against the current definition (including uniqueness and references), then submits. This also guarantees nothing changes between a breaking change's dry run and its application.
+XTDB2 has no uniqueness or foreign-key constraints. In v0 a **single writer** process serialises all writes, data, batch and meta: it validates against the current definition (including uniqueness and references), then submits. Uniqueness is checked against currently-valid and future-valid rows (ADR 0013). The single writer also guarantees nothing changes between a breaking change's dry run and its application.
 
 Later: optimistic checks inside transactions (e.g. `ASSERT`), once XTDB support is verified.
 
 ## Events (ADR 0015)
 
-Transitions, creates, updates and model changes are emitted as events, derived from the transaction log.
+The single writer emits an event for every create, update, transition, repair, erasure and model change.
 
 - **SSE stream** with a resumable cursor (`Last-Event-ID`).
 - **Webhooks** registered by subscribers, with retries.
+
+## Erasure (ADR 0019)
+
+Attributes marked sensitive can be erased for an entity with XTDB `ERASE`, leaving the rest of its history intact. Erasure covers what we store. Values already delivered through events, webhooks, dry-run samples or exports are the recipient's obligation; we emit an `erased` event so they can act. After erasure, replayed events simply lack the field.
 
 ## Deployment (ADR 0014)
 
@@ -152,10 +213,10 @@ Single tenant: one circus per deployment.
 ## Open questions
 
 - `DELETE` semantics: end valid time, or only via lifecycle terminal states?
-- Erasure API for sensitive attributes, built on XTDB `ERASE`.
+- A revert API (`revert-to?valid-at=` for entities and definitions), so "recoverable" can become "reversible".
 - Can model changes be scheduled for a future valid time?
 - How long does a renamed type's `308` last, and who decides?
 - Webhook delivery guarantees, signing and subscription management.
 - JSONata implementation on the JVM (candidate: dashjoin `jsonata-java`), and limits on time and memory.
-- XTDB 2.x specifics to verify: transaction user-metadata, `ASSERT`, and erasure behaviour.
-- Atomic application of breaking changes over very large data sets.
+- XTDB 2.x specifics to verify: transaction user-metadata, `ASSERT`, erasure behaviour, and XTQL vs SQL as the compile target.
+- Atomic application of breaking changes and large batches over very large data sets.
